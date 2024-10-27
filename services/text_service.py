@@ -1,5 +1,6 @@
 import asyncio.exceptions
 import datetime
+import json
 import re
 import traceback
 from collections import defaultdict
@@ -29,6 +30,33 @@ class TextService:
         pass
 
     @staticmethod
+    async def trigger_thinking(message: discord.Message, is_drawing=None):
+        thinking_embed = discord.Embed(
+            title=f"🤖💬 Thinking..." if not is_drawing else f"🤖🎨 Drawing...",
+            color=0x808080,
+        )
+
+        thinking_embed.set_footer(text="This may take a few seconds.")
+        try:
+            thinking_message = await message.reply(embed=thinking_embed)
+        except:
+            thinking_message = None
+
+        try:
+            await message.channel.trigger_typing()
+        except Exception:
+            thinking_message = None
+
+        return thinking_message
+
+    @staticmethod
+    async def stop_thinking(thinking_message: discord.Message):
+        try:
+            await thinking_message.delete()
+        except:
+            pass
+
+    @staticmethod
     async def encapsulated_send(
         converser_cog,
         id,
@@ -47,6 +75,7 @@ class TextService:
         from_ask_action=False,
         from_other_action=None,
         from_message_context=None,
+        is_drawable=False,
     ):
         """General service function for sending and receiving gpt generations
 
@@ -207,9 +236,9 @@ class TextService:
                     if redo_request:
                         _prompt_with_history = _prompt_with_history[:-2]
 
-                    converser_cog.conversation_threads[
-                        ctx.channel.id
-                    ].history = _prompt_with_history
+                    converser_cog.conversation_threads[ctx.channel.id].history = (
+                        _prompt_with_history
+                    )
 
                     # Ensure that the last prompt in this list is the prompt we just sent (new_prompt_item)
                     if _prompt_with_history[-1].text != new_prompt_item.text:
@@ -239,12 +268,17 @@ class TextService:
                 # We don't need to worry about the differences between interactions and messages in this block,
                 # because if we are in this block, we can only be using a message object for ctx
                 if converser_cog.model.summarize_conversations:
-                    await ctx.reply(
+                    summarizing_message = await ctx.reply(
                         "I'm currently summarizing our current conversation so we can keep chatting, "
                         "give me one moment!"
                     )
 
                     await converser_cog.summarize_conversation(ctx, new_prompt)
+
+                    try:
+                        await summarizing_message.delete()
+                    except:
+                        pass
 
                     # Check again if the prompt is about to go past the token limit
                     new_prompt = (
@@ -646,9 +680,16 @@ class TextService:
 
     @staticmethod
     async def process_conversation_message(
-        converser_cog, message, USER_INPUT_API_KEYS, USER_KEY_DB, file=None
+        converser_cog,
+        message,
+        USER_INPUT_API_KEYS,
+        USER_KEY_DB,
+        files=None,
+        amended_message=None,
     ):
-        content = message.content.strip()
+        content = (
+            message.content.strip() if not amended_message else amended_message.strip()
+        )
         conversing = converser_cog.check_conversing(message.channel.id, content)
 
         # If the user is conversing and they want to end it, end it immediately before we continue any further.
@@ -734,55 +775,86 @@ class TextService:
 
                     return
 
-                if file and image_understanding_model.get_is_usable():
-                    thinking_embed = discord.Embed(
-                        title=f"🤖💬 Interpreting attachment...",
-                        color=0x808080,
-                    )
+                model = converser_cog.conversation_threads[message.channel.id].model
+                file_urls = []
 
-                    thinking_embed.set_footer(text="This may take a few seconds.")
-                    try:
-                        thinking_message = await message.reply(embed=thinking_embed)
-                    except:
-                        traceback.print_exc()
-                        pass
-
-                    try:
-                        await message.channel.trigger_typing()
-                    except Exception:
-                        pass
-                    async with aiofiles.tempfile.NamedTemporaryFile(
-                        delete=False
-                    ) as temp_file:
-                        await file.save(temp_file.name)
-                        try:
-                            image_caption, image_qa, image_ocr = await asyncio.gather(
-                                asyncio.to_thread(
-                                    image_understanding_model.get_image_caption,
-                                    temp_file.name,
-                                ),
-                                asyncio.to_thread(
-                                    image_understanding_model.ask_image_question,
-                                    prompt,
-                                    temp_file.name,
-                                ),
-                                image_understanding_model.do_image_ocr(temp_file.name),
+                if files:
+                    if (
+                        "-vision" not in model
+                        and image_understanding_model.get_is_usable()
+                    ):
+                        add_prompts = []
+                        for num, file in enumerate(files):
+                            thinking_embed = discord.Embed(
+                                title=f"🤖💬 Interpreting attachment without GPT-Vision...",
+                                color=0x808080,
                             )
-                            prompt = (
-                                f"Image Info-Caption: {image_caption}\nImage Info-QA: {image_qa}\nImage Info-OCR: {image_ocr}\n"
-                                + prompt
+
+                            thinking_embed.set_footer(
+                                text="This may take a few seconds."
                             )
                             try:
-                                await thinking_message.delete()
+                                thinking_message = await message.reply(
+                                    embed=thinking_embed
+                                )
                             except:
+                                traceback.print_exc()
                                 pass
-                        except Exception:
-                            traceback.print_exc()
-                            await message.reply(
-                                "I wasn't able to understand the file you gave me."
-                            )
-                            await thinking_message.delete()
-                            return
+
+                            try:
+                                await message.channel.trigger_typing()
+                            except Exception:
+                                pass
+                            async with aiofiles.tempfile.NamedTemporaryFile(
+                                delete=False
+                            ) as temp_file:
+                                await file.save(temp_file.name)
+                                try:
+                                    (
+                                        image_caption,
+                                        llava_output,
+                                        image_ocr,
+                                    ) = await asyncio.gather(
+                                        asyncio.to_thread(
+                                            image_understanding_model.get_image_caption,
+                                            temp_file.name,
+                                        ),
+                                        asyncio.to_thread(
+                                            image_understanding_model.get_llava_answer,
+                                            prompt,
+                                            temp_file.name,
+                                        ),
+                                        image_understanding_model.do_image_ocr(
+                                            temp_file.name
+                                        ),
+                                    )
+                                    llava_output = "".join(list(llava_output))
+
+                                    add_prompt = (
+                                        f"BEGIN IMAGE {num} DATA\nImage Info-Caption: {image_caption}\nImage "
+                                        f"Info-QA: {llava_output}\nImage Info-OCR: {image_ocr}\nEND IMAGE {num}\n DATA\n"
+                                    )
+                                    add_prompts.append(add_prompt)
+                                    try:
+                                        await thinking_message.delete()
+                                    except:
+                                        pass
+                                except Exception:
+                                    traceback.print_exc()
+                                    await message.reply(
+                                        "I wasn't able to understand the file you gave me."
+                                    )
+                                    await thinking_message.delete()
+                                    return
+                        prompt = (
+                            "".join(add_prompts)
+                            + f"Now, the original prompt "
+                            + f"is given below, use the image understanding data to answer the question but don't "
+                            f"refer directly to the data. Original Prompt: " + prompt
+                        )
+                    elif "-vision" in model:
+                        file_urls = [file.url for file in files]
+                        print("The file URLs were found to be" + str(file_urls))
 
                 converser_cog.awaiting_responses.append(message.author.id)
                 converser_cog.awaiting_thread_responses.append(message.channel.id)
@@ -794,11 +866,133 @@ class TextService:
                         EmbeddedConversationItem(
                             f"\n{message.author.display_name}: {prompt} <|endofstatement|>\n",
                             0,
+                            image_urls=file_urls,
                         )
                     )
 
                 # increment the conversation counter for the user
                 converser_cog.conversation_threads[message.channel.id].count += 1
+
+            # Determine if we should draw an image and determine what to draw, and handle the drawing itself
+            # TODO: This should be encapsulated better into some other service or function so we're not cluttering this text service file, this text service file is gross right now..
+            if (
+                "-vision" in model
+                and not converser_cog.pinecone_service
+                and converser_cog.conversation_threads[message.channel.id].drawable
+            ):
+                print("Checking for if the user asked to draw")
+                draw_check_prompt = """
+                Here are some good prompting tips:
+                Describe the Image Content: Start your prompt with the type of image you want, such as "A photograph of...", "A 3D rendering of...", "A sketch of...", or "An illustration of...".
+                Describe the Subject: Clearly state the subject of your image. It could be anything from a person or animal to an abstract concept. Be specific to guide the AI, e.g., "An illustration of an owl...", "A photograph of a president...", "A 3D rendering of a chair...".
+                Add Relevant Details: Include details like colors, shapes, sizes, and textures. Rather than just saying "bear", specify the type (e.g., "brown and black, grizzly or polar"), surroundings (e.g., "a forest or mountain range"), and other details.
+                Describe the Form and Style: Provide details about the form and style, using keywords like "abstract", "minimalist", or "surreal". You can also mention specific artists or artworks to mimic their style, e.g., "Like Salvador Dali" or "Like Andy Warhol’s Shot Marilyns painting".
+                Define the Composition: Use keywords to define the composition, such as resolution, lighting style, aspect ratio, and camera view.
+                Additional Tips:
+                Use understandable keywords; avoid overly complicated or uncommon words.
+                Keep prompts concise; aim for 3 to 7 words, but avoid being overly descriptive.
+                Use multiple adjectives to describe your art’s subject, style, and composition.
+                Avoid conflicting terms with opposite meanings.
+                Use AI copywriting tools like ChatGPT for prompt generation.
+                Research the specific AI art tool you’re using for recognized keywords.
+                Examples:
+                "A 3D rendering of a tree with bright yellow leaves and an abstract style."
+                "An illustration of a mountain in the style of Impressionism with a wide aspect ratio."
+                "A photograph of a steampunk alien taken from a low-angle viewpoint."
+                "A sketch of a raccoon in bright colors and minimalist composition."       
+                
+                You will be given a set of conversation items and you will determine if the intent of the user(s) are to draw/create a picture or not, if the intent is to
+                draw a picture, extract a prompt for the image to draw for use in systems like DALL-E. Respond with JSON after you determine intent to draw or not. In this format:
+                
+                {
+                    "intent_to_draw": true/false,
+                    "prompt": "prompt to draw",
+                    "amount": 1
+                }
+                
+                For example, you determined intent to draw a cat sitting on a chair:
+                {
+                    "intent_to_draw": true,
+                    "prompt": "A cat sitting on a chair",
+                    "amount": 1
+
+                }
+                For example, you determined no intent:
+                {
+                    "intent_to_draw": false,
+                    "prompt": "",
+                    "amount": 1
+                }
+                Make sure you use double quotes around all keys and values. Ensure to OMIT trailing commas.
+                As you can see, the default amount should always be one, but a user can draw up to 4 images. Be hesitant to draw more than 3 images.
+                Only signify an intent to draw when the user has explicitly asked you to draw, sometimes there may be situations where the user is asking you to brainstorm a prompt
+                but not neccessarily draw it, if you are unsure, ask the user explicitly. Ensure your JSON strictly confirms, only output the raw json. no other text.
+                """
+                last_messages = converser_cog.conversation_threads[
+                    message.channel.id
+                ].history[
+                    -6:
+                ]  # Get the last 6 messages to determine context on whether we should draw
+                last_messages = last_messages[1:]
+                try:
+                    thinking_message = await TextService.trigger_thinking(message)
+
+                    response_json = await converser_cog.model.send_chatgpt_chat_request(
+                        last_messages,
+                        "gpt-4-vision-preview",
+                        temp_override=0,
+                        user_displayname=message.author.display_name,
+                        bot_name=BOT_NAME,
+                        system_prompt_override=draw_check_prompt,
+                        respond_json=True,
+                    )
+                    await TextService.stop_thinking(thinking_message)
+                    # This validation is only until we figure out what's wrong with the json response mode for vision.
+                    if response_json["intent_to_draw"]:
+                        thinking_message = await TextService.trigger_thinking(
+                            message, is_drawing=True
+                        )
+
+                        links = await converser_cog.model.send_image_request_within_conversation(
+                            response_json["prompt"],
+                            quality="hd",
+                            image_size="1024x1024",
+                            style="vivid",
+                            num_images=response_json["amount"],
+                        )
+                        await TextService.stop_thinking(thinking_message)
+
+                        image_markdowns = []
+                        for num, link in enumerate(links):
+                            image_markdowns.append(f"[image{num}]({link})")
+                        await message.reply(" ".join(image_markdowns))
+
+                        converser_cog.conversation_threads[
+                            message.channel.id
+                        ].history.append(
+                            EmbeddedConversationItem(
+                                f"\nYou have just generated images for the user, notify the user about what you've drawn\n",
+                                0,
+                                image_urls=links,
+                            )
+                        )
+                except:
+                    try:
+                        await message.reply(
+                            "I encountered an error while trying to draw.."
+                        )
+                        await thinking_message.delete()
+                        converser_cog.conversation_threads[
+                            message.channel.id
+                        ].history.append(
+                            EmbeddedConversationItem(
+                                f"\nYou just tried to generate an image but the generation failed. Notify the user of this now.>\n",
+                                0,
+                            )
+                        )
+                    except:
+                        pass
+                    traceback.print_exc()
 
             # Send the request to the model
             # If conversing, the prompt to send is the history, otherwise, it's just the prompt
@@ -829,21 +1023,7 @@ class TextService:
             )
 
             # Send an embed that tells the user that the bot is thinking
-            thinking_embed = discord.Embed(
-                title=f"🤖💬 Thinking...",
-                color=0x808080,
-            )
-
-            thinking_embed.set_footer(text="This may take a few seconds.")
-            try:
-                thinking_message = await message.reply(embed=thinking_embed)
-            except:
-                pass
-
-            try:
-                await message.channel.trigger_typing()
-            except Exception:
-                pass
+            thinking_message = await TextService.trigger_thinking(message)
             converser_cog.full_conversation_history[message.channel.id].append(prompt)
 
             if not converser_cog.pinecone_service:
@@ -857,10 +1037,13 @@ class TextService:
                 overrides=overrides,
                 model=converser_cog.conversation_threads[message.channel.id].model,
                 custom_api_key=user_api_key,
+                is_drawable=converser_cog.conversation_threads[
+                    message.channel.id
+                ].drawable,
             )
 
             # Delete the thinking embed
-            await thinking_message.delete()
+            await TextService.stop_thinking(thinking_message)
 
             return True
 
@@ -883,7 +1066,7 @@ class TextService:
     @staticmethod
     async def process_conversation_edit(converser_cog, after, original_message):
         if after.author.id in converser_cog.redo_users:
-            if after.id == original_message[after.author.id]:
+            if after.id == original_message.get(after.author.id, None):
                 response_message = converser_cog.redo_users[after.author.id].response
                 ctx = converser_cog.redo_users[after.author.id].ctx
                 await response_message.edit(content="Redoing prompt 🔄...")
@@ -894,13 +1077,11 @@ class TextService:
 
                 if after.channel.id in converser_cog.conversation_threads:
                     # Remove the last two elements from the history array and add the new <username>: prompt
-                    converser_cog.conversation_threads[
-                        after.channel.id
-                    ].history = converser_cog.conversation_threads[
-                        after.channel.id
-                    ].history[
-                        :-2
-                    ]
+                    converser_cog.conversation_threads[after.channel.id].history = (
+                        converser_cog.conversation_threads[after.channel.id].history[
+                            :-2
+                        ]
+                    )
 
                     pinecone_dont_reinsert = None
                     if not converser_cog.pinecone_service:
@@ -915,9 +1096,16 @@ class TextService:
 
                     converser_cog.conversation_threads[after.channel.id].count += 1
 
-                overrides = converser_cog.conversation_threads[
+                conversation_overrides = converser_cog.conversation_threads[
                     after.channel.id
                 ].get_overrides()
+
+                overrides = Override(
+                    conversation_overrides["temperature"],
+                    conversation_overrides["top_p"],
+                    conversation_overrides["frequency_penalty"],
+                    conversation_overrides["presence_penalty"],
+                )
 
                 await TextService.encapsulated_send(
                     converser_cog,
@@ -925,10 +1113,7 @@ class TextService:
                     prompt=edited_content,
                     ctx=ctx,
                     response_message=response_message,
-                    temp_override=overrides["temperature"],
-                    top_p_override=overrides["top_p"],
-                    frequency_penalty_override=overrides["frequency_penalty"],
-                    presence_penalty_override=overrides["presence_penalty"],
+                    overrides=overrides,
                     model=converser_cog.conversation_threads[after.channel.id].model,
                     edited_request=True,
                 )
@@ -974,21 +1159,24 @@ class ConversationView(discord.ui.View):
             self.add_item(EndConvoButton(self.converser_cog))
 
     async def on_timeout(self):
-        # Remove the button from the view/message
-        self.clear_items()
-        # Send a message to the user saying the view has timed out
-        if self.message:
-            # check if the timeout happens in a thread and if it's locked
-            if isinstance(self.message.channel, discord.Thread):
-                if self.message.channel.locked:
-                    return
-            await self.message.edit(
-                view=None,
-            )
-        else:
-            await self.ctx.edit(
-                view=None,
-            )
+        try:
+            # Remove the button from the view/message
+            self.clear_items()
+            # Send a message to the user saying the view has timed out
+            if self.message:
+                # check if the timeout happens in a thread and if it's locked
+                if isinstance(self.message.channel, discord.Thread):
+                    if self.message.channel.locked:
+                        return
+                await self.message.edit(
+                    view=None,
+                )
+            else:
+                await self.ctx.edit(
+                    view=None,
+                )
+        except Exception:
+            pass  # Silently fail, as this usually means we were not able to retrieve the correct webhook token.
 
 
 class EndConvoButton(discord.ui.Button["ConversationView"]):

@@ -10,6 +10,32 @@ class EmbedStatics:
         pass
 
     @staticmethod
+    def paginate_chat_embed(response_text):
+        """Given a response text make embed pages and return a list of the pages."""
+
+        response_text = [
+            response_text[i : i + 3500] for i in range(0, len(response_text), 7000)
+        ]
+        pages = []
+        first = False
+        # Send each chunk as a message
+        for count, chunk in enumerate(response_text, start=1):
+            if not first:
+                page = discord.Embed(
+                    title=f"{count}" if len(response_text) > 1 else "",
+                    description=chunk,
+                )
+                first = True
+            else:
+                page = discord.Embed(
+                    title=f"{count}",
+                    description=chunk,
+                )
+            pages.append(page)
+
+        return pages
+
+    @staticmethod
     def get_api_timeout_embed():
         embed = discord.Embed(
             title="The API timed out. Try again later.",
@@ -240,6 +266,17 @@ class EmbedStatics:
         embed = discord.Embed(
             title="Internet-Connected Chat",
             description=f"An error occured while using internet connected chat: {message}",
+            color=discord.Color.red(),
+        )
+        # thumbnail of https://i.imgur.com/hbdBZfG.png
+        embed.set_thumbnail(url="https://i.imgur.com/hbdBZfG.png")
+        return embed
+
+    @staticmethod
+    def get_code_chat_failure_embed(message):
+        embed = discord.Embed(
+            title="Code Interpreter Chat",
+            description=f"An error occured while using code interpreter chat: {message}",
             color=discord.Color.red(),
         )
         # thumbnail of https://i.imgur.com/hbdBZfG.png

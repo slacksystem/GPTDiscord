@@ -9,27 +9,29 @@ from pathlib import Path
 
 import discord
 import aiohttp
+import openai
+import tiktoken
 from langchain.chat_models import ChatOpenAI
 from llama_index import (
     QuestionAnswerPrompt,
-    GPTSimpleVectorIndex,
+    GPTVectorStoreIndex,
     BeautifulSoupWebReader,
     Document,
     LLMPredictor,
     OpenAIEmbedding,
     SimpleDirectoryReader,
-    MockLLMPredictor,
     MockEmbedding,
     ServiceContext,
-    QueryMode,
+    get_response_synthesizer,
 )
-from llama_index.composability import QASummaryGraphBuilder
-from llama_index.indices.knowledge_graph import GPTKnowledgeGraphIndex
+from llama_index.callbacks import CallbackManager, TokenCountingHandler
+from llama_index.composability import QASummaryQueryEngineBuilder
+from llama_index.retrievers import VectorIndexRetriever
+from llama_index.query_engine import RetrieverQueryEngine, MultiStepQueryEngine
 from llama_index.indices.query.query_transform import StepDecomposeQueryTransform
-from llama_index.optimization import SentenceEmbeddingOptimizer
 from llama_index.prompts.chat_prompts import CHAT_REFINE_PROMPT
 from llama_index.readers.web import DEFAULT_WEBSITE_EXTRACTOR
-from langchain import OpenAI
+from langchain.llms import OpenAI
 
 from models.openai_model import Models
 from services.environment_service import EnvService
@@ -62,13 +64,13 @@ class Search:
             parents=True, exist_ok=True
         )
         # Save the index to file under the user id
-        file = f"{query[:20]}_{date.today().month}_{date.today().day}"
+        file = f"{date.today().month}_{date.today().day}_{query[:20]}"
 
-        index.save_to_disk(
-            EnvService.save_path()
+        index.storage_context.persist(
+            persist_dir=EnvService.save_path()
             / "indexes"
             / f"{str(user_id)}_search"
-            / f"{file}.json"
+            / f"{file}"
         )
 
     def build_search_started_embed(self):
@@ -215,15 +217,16 @@ class Search:
         nodes,
         deep,
         response_mode,
-        model="gpt-3.5-turbo",
+        model,
         multistep=False,
         redo=None,
     ):
-        DEFAULT_SEARCH_NODES = 1
+        DEFAULT_SEARCH_NODES = 4
         if not user_api_key:
             os.environ["OPENAI_API_KEY"] = self.openai_key
         else:
             os.environ["OPENAI_API_KEY"] = user_api_key
+        openai.api_key = os.environ["OPENAI_API_KEY"]
 
         # Initialize the search cost
         price = 0
@@ -236,23 +239,21 @@ class Search:
             )
 
         try:
-            llm_predictor_presearch = OpenAI(
-                max_tokens=50,
-                temperature=0.4,
+            llm_predictor_presearch = ChatOpenAI(
+                max_tokens=100,
+                temperature=0,
                 presence_penalty=0.65,
-                model_name="text-davinci-003",
+                model_name=model,
             )
 
             # Refine a query to send to google custom search API
             prompt = f"You are to be given a search query for google. Change the query such that putting it into the Google Custom Search API will return the most relevant websites to assist in answering the original query. If the original query is inferring knowledge about the current day, insert the current day into the refined prompt. If the original query is inferring knowledge about the current month, insert the current month and year into the refined prompt. If the original query is inferring knowledge about the current year, insert the current year into the refined prompt. Generally, if the original query is inferring knowledge about something that happened recently, insert the current month into the refined query. Avoid inserting a day, month, or year for queries that purely ask about facts and about things that don't have much time-relevance. The current date is {str(datetime.now().date())}. Do not insert the current date if not neccessary. Respond with only the refined query for the original query. Don’t use punctuation or quotation marks.\n\nExamples:\n---\nOriginal Query: ‘Who is Harald Baldr?’\nRefined Query: ‘Harald Baldr biography’\n---\nOriginal Query: ‘What happened today with the Ohio train derailment?’\nRefined Query: ‘Ohio train derailment details {str(datetime.now().date())}’\n---\nOriginal Query: ‘Is copper in drinking water bad for you?’\nRefined Query: ‘copper in drinking water adverse effects’\n---\nOriginal Query: What's the current time in Mississauga?\nRefined Query: current time Mississauga\nNow, refine the user input query.\nOriginal Query: {query}\nRefined Query:"
-            query_refined = await llm_predictor_presearch.agenerate(
-                prompts=[prompt],
+            query_refined = await llm_predictor_presearch.apredict(
+                text=prompt,
             )
-            query_refined_text = query_refined.generations[0][0].text
+            query_refined_text = query_refined
 
-            price += await self.usage_service.get_price(
-                query_refined.llm_output.get("token_usage").get("total_tokens")
-            )
+            print("The query refined text is: " + query_refined_text)
 
         except Exception as e:
             traceback.print_exc()
@@ -337,35 +338,55 @@ class Search:
 
         embedding_model = OpenAIEmbedding()
 
-        llm_predictor = LLMPredictor(llm=ChatOpenAI(temperature=0, model_name=model))
+        if "vision" in model:
+            llm_predictor = LLMPredictor(
+                llm=ChatOpenAI(temperature=0, model=model, max_tokens=4096)
+            )
+        else:
+            llm_predictor = LLMPredictor(llm=ChatOpenAI(temperature=0, model=model))
 
-        service_context = ServiceContext.from_defaults(embed_model=embedding_model)
+        token_counter = TokenCountingHandler(
+            tokenizer=tiktoken.encoding_for_model(model).encode, verbose=False
+        )
+
+        callback_manager = CallbackManager([token_counter])
+
+        service_context = ServiceContext.from_defaults(
+            llm_predictor=llm_predictor,
+            embed_model=embedding_model,
+            callback_manager=callback_manager,
+        )
+
+        # Check price
+        token_counter_mock = TokenCountingHandler(
+            tokenizer=tiktoken.encoding_for_model(model).encode, verbose=False
+        )
+        callback_manager_mock = CallbackManager([token_counter_mock])
+        embed_model_mock = MockEmbedding(embed_dim=1536)
+        service_context_mock = ServiceContext.from_defaults(
+            embed_model=embed_model_mock, callback_manager=callback_manager_mock
+        )
+        self.loop.run_in_executor(
+            None,
+            partial(
+                GPTVectorStoreIndex.from_documents,
+                documents,
+                service_context=service_context_mock,
+            ),
+        )
+        total_usage_price = await self.usage_service.get_price(
+            token_counter_mock.total_embedding_token_count, "embedding"
+        )
+        if total_usage_price > 1.00:
+            raise ValueError(
+                "Doing this search would be prohibitively expensive. Please try a narrower search scope."
+            )
 
         if not deep:
-            embed_model_mock = MockEmbedding(embed_dim=1536)
-            service_context_mock = ServiceContext.from_defaults(
-                embed_model=embed_model_mock
-            )
-            self.loop.run_in_executor(
-                None,
-                partial(
-                    GPTSimpleVectorIndex.from_documents,
-                    documents,
-                    service_context=service_context_mock,
-                ),
-            )
-            total_usage_price = await self.usage_service.get_price(
-                embed_model_mock.last_token_usage, embeddings=True
-            )
-            if total_usage_price > 1.00:
-                raise ValueError(
-                    "Doing this search would be prohibitively expensive. Please try a narrower search scope."
-                )
-
             index = await self.loop.run_in_executor(
                 None,
                 partial(
-                    GPTSimpleVectorIndex.from_documents,
+                    GPTVectorStoreIndex.from_documents,
                     documents,
                     service_context=service_context,
                     use_async=True,
@@ -375,108 +396,75 @@ class Search:
             if not redo:
                 self.add_search_index(
                     index,
-                    ctx.user.id
-                    if isinstance(ctx, discord.ApplicationContext)
-                    else ctx.author.id,
+                    (
+                        ctx.user.id
+                        if isinstance(ctx, discord.ApplicationContext)
+                        else ctx.author.id
+                    ),
                     query,
                 )
 
-            await self.usage_service.update_usage(
-                embedding_model.last_token_usage, embeddings=True
-            )
-            price += total_usage_price
         else:
-            llm_predictor_deep = LLMPredictor(
-                llm=ChatOpenAI(temperature=0, model_name=model)
-            )
-
             if ctx:
                 await self.try_edit(
                     in_progress_message,
                     self.build_search_determining_price_embed(query_refined_text),
                 )
 
-            service_context = ServiceContext.from_defaults(
-                embed_model=embedding_model,
-                llm_predictor=llm_predictor_deep,
-                chunk_size_limit=512,
-            )
-            graph_builder = QASummaryGraphBuilder(service_context=service_context)
+            graph_builder = QASummaryQueryEngineBuilder(service_context=service_context)
 
             index = await self.loop.run_in_executor(
                 None,
                 partial(
-                    graph_builder.build_graph_from_documents,
+                    graph_builder.build_from_documents,
                     documents,
                 ),
             )
-
-            total_usage_price = await self.usage_service.get_price(
-                llm_predictor_deep.last_token_usage,
-                chatgpt=True,
-                gpt4=True if model in Models.GPT4_MODELS else False,
-            ) + await self.usage_service.get_price(
-                embedding_model.last_token_usage, embeddings=True
-            )
-
-            await self.usage_service.update_usage(
-                embedding_model.last_token_usage, embeddings=True
-            )
-            await self.usage_service.update_usage(
-                llm_predictor_deep.last_token_usage,
-                chatgpt=True,
-                gpt4=True if model in Models.GPT4_MODELS else False,
-            )
-            price += total_usage_price
 
         if ctx:
             await self.try_edit(
                 in_progress_message, self.build_search_indexed_embed(query_refined_text)
             )
 
-        # Now we can search the index for a query:
-        embedding_model.last_token_usage = 0
+        ########################################
 
         if not deep:
-            service_context = ServiceContext.from_defaults(
-                llm_predictor=llm_predictor, embed_model=embedding_model
-            )
             step_decompose_transform = StepDecomposeQueryTransform(
-                llm_predictor, verbose=True
+                service_context.llm_predictor
+            )
+
+            retriever = VectorIndexRetriever(
+                index=index,
+                similarity_top_k=nodes or DEFAULT_SEARCH_NODES,
+            )
+
+            response_synthesizer = get_response_synthesizer(
+                response_mode=response_mode,
+                use_async=True,
+                refine_template=CHAT_REFINE_PROMPT,
+                text_qa_template=self.qaprompt,
+                service_context=service_context,
+            )
+
+            query_engine = RetrieverQueryEngine(
+                retriever=retriever, response_synthesizer=response_synthesizer
+            )
+            multistep_query_engine = MultiStepQueryEngine(
+                query_engine=query_engine,
+                query_transform=step_decompose_transform,
+                index_summary="Provides information about everything you need to know about this topic, use this to answer the question.",
             )
             if multistep:
-                index.index_struct.summary = "Provides information about everything you need to know about this topic, use this to answer the question."
-
-            response = await self.loop.run_in_executor(
-                None,
-                partial(
-                    index.query,
-                    query,
-                    service_context=service_context,
-                    refine_template=CHAT_REFINE_PROMPT,
-                    similarity_top_k=nodes or DEFAULT_SEARCH_NODES,
-                    text_qa_template=self.qaprompt,
-                    use_async=True,
-                    response_mode=response_mode,
-                    optimizer=SentenceEmbeddingOptimizer(percentile_cutoff=0.7),
-                    query_transform=step_decompose_transform if multistep else None,
-                ),
-            )
+                response = await self.loop.run_in_executor(
+                    None,
+                    partial(multistep_query_engine.query, query),
+                )
+            else:
+                response = await self.loop.run_in_executor(
+                    None,
+                    partial(query_engine.query, query),
+                )
         else:
-            # response = await self.loop.run_in_executor(
-            #     None,
-            #     partial(
-            #         index.query,
-            #         query,
-            #         embedding_mode="hybrid",
-            #         refine_template=CHAT_REFINE_PROMPT,
-            #         include_text=True,
-            #         use_async=True,
-            #         similarity_top_k=nodes or DEFAULT_SEARCH_NODES,
-            #         response_mode=response_mode,
-            #         service_context=service_context,
-            #     ),
-            # )
             query_configs = [
                 {
                     "index_struct_type": "simple_dict",
@@ -507,31 +495,27 @@ class Search:
                 partial(
                     index.query,
                     query,
-                    query_configs=query_configs,
-                    service_context=service_context,
                 ),
             )
 
         await self.usage_service.update_usage(
-            llm_predictor.last_token_usage,
-            chatgpt=True,
-            gpt4=True if model in Models.GPT4_MODELS else False,
+            token_counter.total_llm_token_count,
+            await self.usage_service.get_cost_name(model),
         )
         await self.usage_service.update_usage(
-            embedding_model.last_token_usage, embeddings=True
+            token_counter.total_embedding_token_count, "embedding"
         )
         price += await self.usage_service.get_price(
-            llm_predictor.last_token_usage,
-            chatgpt=True,
-            gpt4=True if model in Models.GPT4_MODELS else False,
+            token_counter.total_llm_token_count,
+            await self.usage_service.get_cost_name(model),
         ) + await self.usage_service.get_price(
-            embedding_model.last_token_usage, embeddings=True
+            token_counter.total_embedding_token_count, "embedding"
         )
 
         if ctx:
             await self.try_edit(
                 in_progress_message,
-                self.build_search_final_embed(query_refined_text, str(price)),
+                self.build_search_final_embed(query_refined_text, str(round(price, 6))),
             )
 
         return response, query_refined_text

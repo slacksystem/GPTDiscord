@@ -1,12 +1,13 @@
 import asyncio
 import functools
+import json
 import math
 import os
 import re
 import tempfile
 import traceback
 import uuid
-from typing import Any, Tuple
+from typing import Any, Tuple, List
 
 import aiohttp
 import backoff
@@ -51,8 +52,6 @@ class Models:
     # Text models
     DAVINCI = "text-davinci-003"
     CURIE = "text-curie-001"
-    BABBAGE = "text-babbage-001"
-    ADA = "text-ada-001"
 
     # Embedding models
     EMBEDDINGS = "text-embedding-ada-002"
@@ -62,40 +61,84 @@ class Models:
 
     # ChatGPT Models
     TURBO = "gpt-3.5-turbo"
-    TURBO_DEV = "gpt-3.5-turbo-0301"
+    TURBO_16 = "gpt-3.5-turbo-16k"
+    TURBO_DEV = "gpt-3.5-turbo-0613"
+    TURBO_16_DEV = "gpt-3.5-turbo-16k-0613"
 
     # GPT4 Models
     GPT4 = "gpt-4"
     GPT4_32 = "gpt-4-32k"
+    GPT4_DEV = "gpt-4-0613"
+    GPT4_32_DEV = "gpt-4-32k-0613"
+    GPT_4_TURBO = "gpt-4-1106-preview"
+    GPT_4_TURBO_VISION = "gpt-4-vision-preview"
+    GPT_4_TURBO_CATCHALL = "gpt-4-turbo-preview"
+    GPT_4_TURBO_REGULAR = "gpt-4-turbo"
+    GPT_4_OMEGA = "gpt-4o"
 
     # Model collections
     TEXT_MODELS = [
+        GPT_4_TURBO_REGULAR,
+        GPT_4_OMEGA,
         DAVINCI,
         CURIE,
-        BABBAGE,
-        ADA,
         TURBO,
+        TURBO_16,
         TURBO_DEV,
+        TURBO_16_DEV,
         GPT4,
         GPT4_32,
+        GPT4_DEV,
+        GPT4_32_DEV,
+        GPT_4_TURBO,
+        GPT_4_TURBO_VISION,
+        GPT_4_TURBO_CATCHALL,
     ]
-    CHATGPT_MODELS = [TURBO, TURBO_DEV]
-    GPT4_MODELS = [GPT4, GPT4_32]
+    CHATGPT_MODELS = [
+        GPT_4_TURBO_REGULAR,
+        GPT_4_OMEGA,
+        TURBO,
+        TURBO_16,
+        TURBO_DEV,
+        TURBO_16_DEV,
+        GPT4_32,
+        GPT_4_TURBO_VISION,
+        GPT_4_TURBO,
+        GPT_4_TURBO_CATCHALL,
+    ]
+    GPT4_MODELS = [
+        GPT_4_TURBO_REGULAR,
+        GPT_4_OMEGA,
+        GPT4,
+        GPT4_32,
+        GPT4_DEV,
+        GPT4_32_DEV,
+        GPT_4_TURBO_VISION,
+        GPT_4_TURBO,
+        GPT_4_TURBO_CATCHALL,
+    ]
     EDIT_MODELS = [EDIT]
 
-    DEFAULT = DAVINCI
+    DEFAULT = GPT_4_OMEGA
     LOW_USAGE_MODEL = CURIE
 
     # Tokens Mapping
     TOKEN_MAPPING = {
-        "text-davinci-003": 4024,
-        "text-curie-001": 2024,
-        "text-babbage-001": 2024,
-        "text-ada-001": 2024,
+        DAVINCI: 4024,
+        CURIE: 2024,
         TURBO: 4096,
+        TURBO_16: 16384,
         TURBO_DEV: 4096,
+        TURBO_16_DEV: 16384,
         GPT4: 8192,
         GPT4_32: 32768,
+        GPT4_DEV: 8192,
+        GPT4_32_DEV: 32768,
+        GPT_4_TURBO_VISION: 128000,
+        GPT_4_TURBO: 128000,
+        GPT_4_TURBO_CATCHALL: 128000,
+        GPT_4_TURBO_REGULAR: 128000,
+        GPT_4_OMEGA: 128000,
     }
 
     @staticmethod
@@ -113,13 +156,13 @@ class ImageSize:
 
 class ModelLimits:
     MIN_TOKENS = 15
-    MAX_TOKENS = 4096
+    MAX_TOKENS = 32000
 
     MIN_CONVERSATION_LENGTH = 1
     MAX_CONVERSATION_LENGTH = 100000
 
-    MIN_SUMMARIZE_THRESHOLD = 800
-    MAX_SUMMARIZE_THRESHOLD = 3500
+    MIN_SUMMARIZE_THRESHOLD = 1500
+    MAX_SUMMARIZE_THRESHOLD = 120000
 
     MIN_NUM_IMAGES = 1
     MAX_NUM_IMAGES = 4
@@ -186,8 +229,10 @@ class Model:
             else 100000
         )  # The maximum number of conversation items to keep in memory
         self.model = (
-            SETTINGS_DB["model"] if "model" in SETTINGS_DB else Models.DEFAULT
-        )  # The model to use
+            SETTINGS_DB["model"]
+            if "model" in SETTINGS_DB and SETTINGS_DB["model"] in Models.TEXT_MODELS
+            else Models.DEFAULT
+        )
         self._low_usage_mode = False
         self.usage_service = usage_service
         self.DAVINCI_ROLES = ["admin", "Admin", "GPT", "gpt"]
@@ -207,7 +252,7 @@ class Model:
         self.summarize_threshold = (
             SETTINGS_DB["summarize_threshold"]
             if "summarize_threshold" in SETTINGS_DB
-            else 3000
+            else 5000
         )
         self.model_max_tokens = 4024
         self.welcome_message_enabled = (
@@ -468,6 +513,14 @@ class Model:
         self._max_tokens = Models.get_max_tokens(self._model)
         SETTINGS_DB["model"] = model
 
+        # Set the summarize threshold if the model was set to gpt-4
+        if "4-turbo" in self._model or "4-vision" in self._model:
+            self._summarize_threshold = 125000
+        elif "gpt-4" in self._model:
+            self._summarize_threshold = 28000
+        elif "gpt-3" in self._model:
+            self._summarize_threshold = 6000
+
     @property
     def max_conversation_length(self):
         return self._max_conversation_length
@@ -630,17 +683,12 @@ class Model:
     async def valid_text_request(self, response, model=None):
         try:
             tokens_used = int(response["usage"]["total_tokens"])
-            if model and model in Models.GPT4_MODELS:
-                await self.usage_service.update_usage(
-                    tokens_used,
-                    prompt_tokens=int(response["usage"]["prompt_tokens"]),
-                    completion_tokens=int(response["usage"]["completion_tokens"]),
-                    gpt4=True,
-                )
             if model and model in Models.EDIT_MODELS:
                 pass
             else:
-                await self.usage_service.update_usage(tokens_used)
+                await self.usage_service.update_usage(
+                    tokens_used, await self.usage_service.get_cost_name(model)
+                )
         except Exception as e:
             traceback.print_exc()
             if "error" in response:
@@ -779,35 +827,46 @@ class Model:
 
         summary_request_text = "".join(summary_request_text)
 
-        tokens = self.usage_service.count_tokens(summary_request_text)
+        messages = []
+        messages.append(
+            {
+                "role": "system",
+                "content": summary_request_text,
+            }
+        )
 
-        async with aiohttp.ClientSession(raise_for_status=False) as session:
+        async with aiohttp.ClientSession(
+            raise_for_status=False, timeout=aiohttp.ClientTimeout(total=300)
+        ) as session:
             payload = {
-                "model": Models.DAVINCI,
-                "prompt": summary_request_text,
-                "temperature": 0.5,
-                "top_p": 1,
-                "max_tokens": self.max_tokens - tokens,
+                "model": self.model if self.model is not None else Models.GPT4_32,
+                "messages": messages,
+                "temperature": self.temp,
+                "top_p": self.top_p,
                 "presence_penalty": self.presence_penalty,
                 "frequency_penalty": self.frequency_penalty,
-                "best_of": self.best_of,
             }
             headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}",
+                "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}"
             }
             self.use_org = True if "true" in str(self.use_org).lower() else False
             if self.use_org:
                 if self.openai_organization:
                     headers["OpenAI-Organization"] = self.openai_organization
+
             async with session.post(
-                "https://api.openai.com/v1/completions", json=payload, headers=headers
+                "https://api.openai.com/v1/chat/completions",
+                json=payload,
+                headers=headers,
             ) as resp:
                 response = await resp.json()
-
-                await self.valid_text_request(response)
-
-                # print(response["choices"][0]["text"])
+                # print(f"Payload -> {payload}")
+                # Parse the total tokens used for this request and response pair from the response
+                await self.valid_text_request(
+                    response,
+                    model=self.model if self.model is not None else Models.GPT4_32,
+                )
+                print(f"Summary response -> {response}")
 
                 return response
 
@@ -823,9 +882,9 @@ class Model:
         self,
         text,
         pretext,
-    ) -> (
-        Tuple[dict, bool]
-    ):  # The response, and a boolean indicating whether or not the context limit was reached.
+    ) -> Tuple[
+        dict, bool
+    ]:  # The response, and a boolean indicating whether or not the context limit was reached.
         # Validate that  all the parameters are in a good state before we send the request
 
         prompt = f"{pretext}{text}\nOutput:"
@@ -889,10 +948,14 @@ class Model:
         max_tokens_override=None,
         stop=None,
         custom_api_key=None,
-    ) -> (
-        Tuple[dict, bool]
-    ):  # The response, and a boolean indicating whether or not the context limit was reached.
+        system_prompt_override=None,
+        respond_json=None,
+    ) -> Tuple[
+        dict, bool
+    ]:  # The response, and a boolean indicating whether or not the context limit was reached.
         # Validate that  all the parameters are in a good state before we send the request
+        model_selection = self.model if not model else model
+        print("The model selection is " + model_selection)
 
         # Clean up the bot name
         bot_name_clean = self.cleanse_username(bot_name)
@@ -902,63 +965,130 @@ class Model:
         messages = []
         for number, message in enumerate(prompt_history):
             if number == 0:
-                # If this is the first message, it is the context prompt.
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": message.text,
-                    }
-                )
-                continue
+                if not system_prompt_override:
+                    # If this is the first message, it is the context prompt.
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": message.text,
+                        }
+                    )
+                    continue
+                else:
+                    # When we have a system prompt override, we're trying to do a one-off chatcompletion WITH VISION. So we use the override
+                    # param as the new system prompt and the first message as the user message. This is messy, and I'll clean it up soon
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": system_prompt_override,
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "name": user_displayname,
+                            "content": message.text,
+                        }
+                    )
+                    continue
 
-            if message.text.startswith(f"\n{bot_name}"):
-                text = message.text.replace(bot_name, "")
-                text = text.replace("<|endofstatement|>", "")
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": text,
-                    }  # TODO add back the assistant's name when the API is fixed..
-                )
-            else:
-                try:
-                    if (
-                        message.text.strip()
-                        .lower()
-                        .startswith("this conversation has some context from earlier")
-                    ):
-                        raise Exception("This is a context message")
+            try:
+                if (
+                    message.text.strip()
+                    .lower()
+                    .startswith("this conversation has some context from earlier")
+                ):
+                    raise Exception("This is a context message")
 
+                if message.text.startswith(f"\n{bot_name}"):
+                    role = "assistant"
+                    text = message.text.replace(bot_name, "")
+                    text = text.replace("<|endofstatement|>", "")
+                else:
+                    role = "user"
                     username = re.search(r"(?<=\n)(.*?)(?=:)", message.text).group()
                     username_clean = self.cleanse_username(username)
                     text = message.text.replace(f"{username}:", "")
                     # Strip whitespace just from the right side of the string
                     text = text.rstrip()
                     text = text.replace("<|endofstatement|>", "")
+
+                if "-vision" not in model_selection:
                     messages.append(
-                        {"role": "user", "name": username_clean, "content": text}
+                        {
+                            "role": role,
+                            "name": (
+                                username_clean if role == "user" else bot_name_clean
+                            ),
+                            "content": text,
+                        }
                     )
-                except Exception:
-                    text = message.text.replace("<|endofstatement|>", "")
-                    messages.append({"role": "system", "content": text})
+
+                else:
+                    if len(message.image_urls) > 0:
+                        messages.append(
+                            {
+                                "role": role,
+                                "name": (
+                                    username_clean if role == "user" else bot_name_clean
+                                ),
+                                "content": [
+                                    {"type": "text", "text": text},
+                                ],
+                            }
+                        )
+                        for image_url in message.image_urls:
+                            image_info = {
+                                "type": "image_url",
+                                "image_url": {"url": image_url, "detail": "high"},
+                            }
+                            messages[-1]["content"].append(image_info)
+                    else:
+                        messages.append(
+                            {
+                                "role": role,
+                                "name": (
+                                    username_clean if role == "user" else bot_name_clean
+                                ),
+                                "content": [
+                                    {"type": "text", "text": text},
+                                ],
+                            }
+                        )
+            except Exception:
+                text = message.text.replace("<|endofstatement|>", "")
+                messages.append({"role": "system", "content": text})
 
         print(f"Messages -> {messages}")
         async with aiohttp.ClientSession(
             raise_for_status=False, timeout=aiohttp.ClientTimeout(total=300)
         ) as session:
             payload = {
-                "model": self.model if not model else model,
+                "model": model_selection,
                 "messages": messages,
                 "stop": "" if stop is None else stop,
                 "temperature": self.temp if temp_override is None else temp_override,
                 "top_p": self.top_p if top_p_override is None else top_p_override,
-                "presence_penalty": self.presence_penalty
-                if presence_penalty_override is None
-                else presence_penalty_override,
-                "frequency_penalty": self.frequency_penalty
-                if frequency_penalty_override is None
-                else frequency_penalty_override,
+                "presence_penalty": (
+                    self.presence_penalty
+                    if presence_penalty_override is None
+                    else presence_penalty_override
+                ),
+                "frequency_penalty": (
+                    self.frequency_penalty
+                    if frequency_penalty_override is None
+                    else frequency_penalty_override
+                ),
             }
+            if "-preview" in model_selection:
+                payload["max_tokens"] = (
+                    4096  # TODO Not sure if this needs to be subtracted from a token count..
+                )
+            if respond_json:
+                # payload["response_format"] = { "type": "json_object" }
+                # TODO The above needs to be fixed, doesn't work for some reason?
+                pass
+
             headers = {
                 "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}"
             }
@@ -980,6 +1110,18 @@ class Model:
                 )
                 print(f"Response -> {response}")
 
+                # Temporary until we can ensure json response via the API, for some reason upstream pydantic complains when
+                # we pass response_format in the request..
+                if respond_json:
+                    response_text = response["choices"][0]["message"]["content"].strip()
+                    response_text = response_text.replace("```json", "")
+                    response_text = response_text.replace("```", "")
+                    try:
+                        response_text = json.loads(response_text)
+                        return response_text
+                    except Exception:
+                        raise ValueError("Could not decode JSON response from the API")
+
                 return response
 
     @backoff.on_exception(
@@ -1000,17 +1142,20 @@ class Model:
             data = aiohttp.FormData()
             data.add_field("model", "whisper-1")
             print("audio." + file.filename.split(".")[-1])
+            # TODO: make async
             data.add_field(
                 "file",
-                await file.read()
-                if isinstance(file, discord.Attachment)
-                else await file.fp.read(),
-                filename="audio." + file.filename.split(".")[-1]
-                if isinstance(file, discord.Attachment)
-                else "audio.mp4",
-                content_type=file.content_type
-                if isinstance(file, discord.Attachment)
-                else "video/mp4",
+                file.read() if isinstance(file, discord.Attachment) else file.fp.read(),
+                filename=(
+                    "audio." + file.filename.split(".")[-1]
+                    if isinstance(file, discord.Attachment)
+                    else "audio.mp4"
+                ),
+                content_type=(
+                    file.content_type
+                    if isinstance(file, discord.Attachment)
+                    else "video/mp4"
+                ),
             )
 
             if temperature_override:
@@ -1086,22 +1231,28 @@ class Model:
                     "model": self.model if model is None else model,
                     "prompt": prompt,
                     "stop": "" if stop is None else stop,
-                    "temperature": self.temp
-                    if temp_override is None
-                    else temp_override,
+                    "temperature": (
+                        self.temp if temp_override is None else temp_override
+                    ),
                     "top_p": self.top_p if top_p_override is None else top_p_override,
-                    "max_tokens": self.max_tokens - tokens
-                    if max_tokens_override is None
-                    else max_tokens_override,
-                    "presence_penalty": self.presence_penalty
-                    if presence_penalty_override is None
-                    else presence_penalty_override,
-                    "frequency_penalty": self.frequency_penalty
-                    if frequency_penalty_override is None
-                    else frequency_penalty_override,
-                    "best_of": self.best_of
-                    if not best_of_override
-                    else best_of_override,
+                    "max_tokens": (
+                        self.max_tokens - tokens
+                        if max_tokens_override is None
+                        else max_tokens_override
+                    ),
+                    "presence_penalty": (
+                        self.presence_penalty
+                        if presence_penalty_override is None
+                        else presence_penalty_override
+                    ),
+                    "frequency_penalty": (
+                        self.frequency_penalty
+                        if frequency_penalty_override is None
+                        else frequency_penalty_override
+                    ),
+                    "best_of": (
+                        self.best_of if not best_of_override else best_of_override
+                    ),
                 }
                 headers = {
                     "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}"
@@ -1129,21 +1280,31 @@ class Model:
             async with aiohttp.ClientSession(
                 raise_for_status=False, timeout=aiohttp.ClientTimeout(total=300)
             ) as session:
+                model_selection = self.model if not model else model
                 payload = {
-                    "model": self.model if not model else model,
+                    "model": model_selection,
                     "messages": messages,
                     "stop": "" if stop is None else stop,
-                    "temperature": self.temp
-                    if temp_override is None
-                    else temp_override,
+                    "temperature": (
+                        self.temp if temp_override is None else temp_override
+                    ),
                     "top_p": self.top_p if top_p_override is None else top_p_override,
-                    "presence_penalty": self.presence_penalty
-                    if presence_penalty_override is None
-                    else presence_penalty_override,
-                    "frequency_penalty": self.frequency_penalty
-                    if frequency_penalty_override is None
-                    else frequency_penalty_override,
+                    "presence_penalty": (
+                        self.presence_penalty
+                        if presence_penalty_override is None
+                        else presence_penalty_override
+                    ),
+                    "frequency_penalty": (
+                        self.frequency_penalty
+                        if frequency_penalty_override is None
+                        else frequency_penalty_override
+                    ),
                 }
+                if "preview" in model_selection:
+                    payload["max_tokens"] = (
+                        4096  # Temporary workaround while 4-turbo and vision are in preview.
+                    )
+
                 headers = {
                     "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}"
                 }
@@ -1188,78 +1349,7 @@ class Model:
 
                 return response
 
-    @backoff.on_exception(
-        backoff.expo,
-        aiohttp.ClientResponseError,
-        factor=3,
-        base=5,
-        max_tries=4,
-        on_backoff=backoff_handler_http,
-    )
-    async def send_image_request(
-        self, ctx, prompt, vary=None, custom_api_key=None
-    ) -> tuple[File, list[Any]]:
-        # Validate that  all the parameters are in a good state before we send the request
-        words = len(prompt.split(" "))
-        if words < 1 or words > 75:
-            raise ValueError(
-                "Prompt must be greater than 1 word and less than 75, it is currently "
-                + str(words)
-            )
-
-        # print("The prompt about to be sent is " + prompt)
-        await self.usage_service.update_usage_image(self.image_size)
-
-        response = None
-
-        if not vary:
-            payload = {"prompt": prompt, "n": self.num_images, "size": self.image_size}
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}",
-            }
-            self.use_org = True if "true" in str(self.use_org).lower() else False
-            if self.use_org:
-                if self.openai_organization:
-                    headers["OpenAI-Organization"] = self.openai_organization
-
-            async with aiohttp.ClientSession(
-                raise_for_status=True, timeout=aiohttp.ClientTimeout(total=300)
-            ) as session:
-                async with session.post(
-                    "https://api.openai.com/v1/images/generations",
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    response = await resp.json()
-
-        else:
-            async with aiohttp.ClientSession(
-                raise_for_status=True, timeout=aiohttp.ClientTimeout(total=300)
-            ) as session:
-                data = aiohttp.FormData()
-                data.add_field("n", str(self.num_images))
-                data.add_field("size", self.image_size)
-                with open(vary, "rb") as f:
-                    data.add_field(
-                        "image", f, filename="file.png", content_type="image/png"
-                    )
-
-                    async with session.post(
-                        "https://api.openai.com/v1/images/variations",
-                        headers={
-                            "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}",
-                        },
-                        data=data,
-                    ) as resp:
-                        response = await resp.json()
-
-        print(response)
-
-        image_urls = []
-        for result in response["data"]:
-            image_urls.append(result["url"])
-
+    async def save_image_urls_and_return(self, image_urls, ctx):
         # For each image url, open it as an image object using PIL
         images = await asyncio.get_running_loop().run_in_executor(
             None,
@@ -1364,4 +1454,204 @@ class Model:
             image_size = os.path.getsize(temp_file.name) / 1000000
             print(f"New image size is {image_size}MB")
 
-        return (discord.File(temp_file.name), image_urls)
+        return discord.File(temp_file.name), image_urls
+
+    async def make_image_request_individual(
+        self, session, url, json_payload, headers
+    ) -> dict:
+        async with session.post(url, json=json_payload, headers=headers) as resp:
+            return await resp.json()
+
+    @backoff.on_exception(
+        backoff.expo,
+        aiohttp.ClientResponseError,
+        factor=3,
+        base=5,
+        max_tries=4,
+        on_backoff=backoff_handler_http,
+    )
+    async def send_image_request(
+        self, ctx, prompt, quality, image_size, style, custom_api_key=None
+    ) -> tuple[File, List[Any]]:
+        words = len(prompt.split(" "))
+        if words < 1 or words > 150:
+            raise ValueError(
+                f"Prompt must be greater than 1 word and less than 150, it is currently {words}"
+            )
+
+        await self.usage_service.update_usage_image(image_size)
+
+        print("Inside a dalle-3 request")
+
+        image_urls = []
+        tasks = []
+        payload = {
+            "prompt": prompt,
+            "quality": quality,
+            "style": style,
+            "model": "dall-e-3",
+            "size": image_size,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}",
+        }
+        self.use_org = "true" in str(self.use_org).lower()
+        if self.use_org and self.openai_organization:
+            headers["OpenAI-Organization"] = self.openai_organization
+
+        # Setup the client session outside of the loop
+        async with aiohttp.ClientSession(
+            raise_for_status=True, timeout=aiohttp.ClientTimeout(total=300)
+        ) as session:
+            # Create a coroutine for each image request and store it in the tasks list
+            for _ in range(self.num_images):
+                task = self.make_image_request_individual(
+                    session,
+                    "https://api.openai.com/v1/images/generations",
+                    payload,
+                    headers,
+                )
+                tasks.append(task)
+
+            # Run all tasks in parallel and wait for them to complete
+            responses = await asyncio.gather(*tasks)
+
+            # Process the results
+            for response in responses:
+                print(response)
+                for result in response["data"]:
+                    image_urls.append(result["url"])
+
+        # Now all the requests are done, we can save the URLs
+        return await self.save_image_urls_and_return(image_urls, ctx)
+
+    @backoff.on_exception(
+        backoff.expo,
+        aiohttp.ClientResponseError,
+        factor=3,
+        base=5,
+        max_tries=4,
+        on_backoff=backoff_handler_http,
+    )
+    async def send_image_request_within_conversation(
+        self, prompt, quality, image_size, style, custom_api_key=None, num_images=1
+    ) -> List[str]:
+        await self.usage_service.update_usage_image(image_size)
+
+        print("Inside a dalle-3 request")
+
+        image_urls = []
+        tasks = []
+        payload = {
+            "prompt": prompt,
+            "quality": quality,
+            "style": style,
+            "model": "dall-e-3",
+            "size": image_size,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}",
+        }
+        self.use_org = "true" in str(self.use_org).lower()
+        if self.use_org and self.openai_organization:
+            headers["OpenAI-Organization"] = self.openai_organization
+
+        # Setup the client session outside of the loop
+        async with aiohttp.ClientSession(
+            raise_for_status=True, timeout=aiohttp.ClientTimeout(total=300)
+        ) as session:
+            # Create a coroutine for each image request and store it in the tasks list
+            for _ in range(num_images):
+                task = self.make_image_request_individual(
+                    session,
+                    "https://api.openai.com/v1/images/generations",
+                    payload,
+                    headers,
+                )
+                tasks.append(task)
+
+            # Run all tasks in parallel and wait for them to complete
+            responses = await asyncio.gather(*tasks)
+
+            # Process the results
+            for response in responses:
+                print(response)
+                for result in response["data"]:
+                    image_urls.append(result["url"])
+
+        # Now all the requests are done, we can save the URLs
+        return image_urls
+
+    @backoff.on_exception(
+        backoff.expo,
+        aiohttp.ClientResponseError,
+        factor=3,
+        base=5,
+        max_tries=4,
+        on_backoff=backoff_handler_http,
+    )
+    async def send_image_request_old(
+        self, ctx, prompt, vary=None, custom_api_key=None
+    ) -> tuple[File, list[Any]]:
+        # Validate that  all the parameters are in a good state before we send the request
+        words = len(prompt.split(" "))
+        if words < 1 or words > 75:
+            raise ValueError(
+                "Prompt must be greater than 1 word and less than 75, it is currently "
+                + str(words)
+            )
+
+        # print("The prompt about to be sent is " + prompt)
+        await self.usage_service.update_usage_image(self.image_size)
+
+        response = None
+
+        if not vary:
+            payload = {"prompt": prompt, "n": self.num_images, "size": self.image_size}
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}",
+            }
+            self.use_org = True if "true" in str(self.use_org).lower() else False
+            if self.use_org:
+                if self.openai_organization:
+                    headers["OpenAI-Organization"] = self.openai_organization
+
+            async with aiohttp.ClientSession(
+                raise_for_status=True, timeout=aiohttp.ClientTimeout(total=300)
+            ) as session:
+                async with session.post(
+                    "https://api.openai.com/v1/images/generations",
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    response = await resp.json()
+
+        else:
+            async with aiohttp.ClientSession(
+                raise_for_status=True, timeout=aiohttp.ClientTimeout(total=300)
+            ) as session:
+                data = aiohttp.FormData()
+                data.add_field("n", str(self.num_images))
+                data.add_field("size", self.image_size)
+                with open(vary, "rb") as f:
+                    data.add_field(
+                        "image", f, filename="file.png", content_type="image/png"
+                    )
+
+                    async with session.post(
+                        "https://api.openai.com/v1/images/variations",
+                        headers={
+                            "Authorization": f"Bearer {self.openai_key if not custom_api_key else custom_api_key}",
+                        },
+                        data=data,
+                    ) as resp:
+                        response = await resp.json()
+
+        image_urls = []
+        for result in response["data"]:
+            image_urls.append(result["url"])
+
+        return await self.save_image_urls_and_return(image_urls, ctx)

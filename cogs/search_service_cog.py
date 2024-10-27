@@ -10,42 +10,40 @@ from typing import Optional, Dict, Any
 import aiohttp
 import re
 import discord
+import openai
 from bs4 import BeautifulSoup
 from discord.ext import pages
-from langchain import (
+from langchain.utilities import (
     GoogleSearchAPIWrapper,
-    WolframAlphaAPIWrapper,
-    FAISS,
-    InMemoryDocstore,
-    LLMChain,
-    ConversationChain,
 )
+from langchain.utilities import WolframAlphaAPIWrapper
 from langchain.agents import (
     Tool,
     initialize_agent,
     AgentType,
-    ZeroShotAgent,
-    AgentExecutor,
 )
 from langchain.chat_models import ChatOpenAI
-from langchain.memory import ConversationBufferMemory, CombinedMemory
-from langchain.prompts import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    MessagesPlaceholder,
-    HumanMessagePromptTemplate,
+from langchain.memory import (
+    ConversationSummaryBufferMemory,
 )
-from langchain.requests import TextRequestsWrapper, Requests
+from langchain.prompts import (
+    MessagesPlaceholder,
+)
+from langchain.requests import Requests
+from langchain.schema import SystemMessage
 from llama_index import (
-    GPTSimpleVectorIndex,
+    GPTVectorStoreIndex,
     Document,
     SimpleDirectoryReader,
     ServiceContext,
     OpenAIEmbedding,
 )
+from llama_index.response_synthesizers import get_response_synthesizer, ResponseMode
+from llama_index.retrievers import VectorIndexRetriever
+from llama_index.query_engine import RetrieverQueryEngine
 from llama_index.prompts.chat_prompts import CHAT_REFINE_PROMPT
 from pydantic import Extra, BaseModel
-from transformers import GPT2TokenizerFast
+import tiktoken
 
 from models.embed_statics_model import EmbedStatics
 from models.search_model import Search
@@ -53,6 +51,8 @@ from services.deletion_service import Deletion
 from services.environment_service import EnvService
 from services.moderations_service import Moderation
 from services.text_service import TextService
+from models.openai_model import Models
+from utils.safe_ctx_respond import safe_ctx_respond, safe_remove_list
 
 from contextlib import redirect_stdout
 
@@ -130,6 +130,8 @@ GOOGLE_SEARCH_ENGINE_ID = EnvService.get_google_search_engine_id()
 OPENAI_API_KEY = EnvService.get_openai_token()
 # Set the environment
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+openai.api_key = os.environ["OPENAI_API_KEY"]
+
 WOLFRAM_API_KEY = EnvService.get_wolfram_api_key()
 
 vector_stores = {}
@@ -152,7 +154,6 @@ class CustomTextRequestWrapper(BaseModel):
 
     headers: Optional[Dict[str, str]] = None
     aiosession: Optional[aiohttp.ClientSession] = None
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 
     class Config:
         """Configuration for this pydantic object."""
@@ -170,14 +171,21 @@ class CustomTextRequestWrapper(BaseModel):
     def get(self, url: str, **kwargs: Any) -> str:
         # the "url" field is actuall some input from the LLM, it is a comma separated string of the url and a boolean value and the original query
         try:
-            url, use_gpt4, original_query = url.split(",")
+            url, model, original_query = url.split(",")
+            url = url.strip()
+            model = model.strip()
+            original_query = original_query.strip()
         except:
             url = url
-            use_gpt4 = False
+            model = "gpt-3.5-turbo"
             original_query = "No Original Query Provided"
 
-        use_gpt4 = use_gpt4 == "True"
         """GET the URL and return the text."""
+        if not url.startswith("http"):
+            return (
+                "The website could not be crawled as an invalid URL was input. The input URL was "
+                + url
+            )
         text = self.requests.get(url, **kwargs).text
 
         # Load this text into BeautifulSoup, clean it up and only retain text content within <p> and <title> and <h1> type tags, get rid of all javascript and css too.
@@ -191,29 +199,41 @@ class CustomTextRequestWrapper(BaseModel):
         text = soup.get_text()
 
         # Clean up white spaces
-        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
 
         # If not using GPT-4 and the text token amount is over 3500, truncate it to 3500 tokens
-        tokens = len(self.tokenizer(text)["input_ids"])
-        print("The scraped text content is: " + text)
+        enc = tiktoken.encoding_for_model(model)
+        tokens = len(enc.encode(text))
         if len(text) < 5:
             return "This website could not be scraped. I cannot answer this question."
-        if (not use_gpt4 and tokens > 3000) or (use_gpt4 and tokens > 7000):
+        if (
+            model in Models.CHATGPT_MODELS
+            and tokens > Models.get_max_tokens(model) - 1000
+        ) or (
+            model in Models.GPT4_MODELS and tokens > Models.get_max_tokens(model) - 1000
+        ):
             with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
                 f.write(text)
                 f.close()
                 document = SimpleDirectoryReader(input_files=[f.name]).load_data()
                 embed_model = OpenAIEmbedding()
                 service_context = ServiceContext.from_defaults(embed_model=embed_model)
-                index = GPTSimpleVectorIndex.from_documents(
+                index = GPTVectorStoreIndex.from_documents(
                     document, service_context=service_context, use_async=True
                 )
-                response_text = index.query(
-                    original_query,
-                    refine_template=CHAT_REFINE_PROMPT,
-                    similarity_top_k=4,
-                    response_mode="compact",
+                retriever = VectorIndexRetriever(
+                    index=index, similarity_top_k=4, service_context=service_context
                 )
+                response_synthesizer = get_response_synthesizer(
+                    response_mode=ResponseMode.COMPACT,
+                    refine_template=CHAT_REFINE_PROMPT,
+                    service_context=service_context,
+                    use_async=True,
+                )
+                query_engine = RetrieverQueryEngine(
+                    retriever=retriever, response_synthesizer=response_synthesizer
+                )
+                response_text = query_engine.query(original_query)
                 return response_text
 
         return text
@@ -256,9 +276,9 @@ class SearchService(discord.Cog, name="SearchService"):
         for count, chunk in enumerate(response_text, start=1):
             if not first:
                 page = discord.Embed(
-                    title="Search Results"
-                    if not original_link
-                    else "Follow-up results",
+                    title=(
+                        "Search Results" if not original_link else "Follow-up results"
+                    ),
                     description=chunk,
                     url=original_link,
                 )
@@ -281,31 +301,6 @@ class SearchService(discord.Cog, name="SearchService"):
 
         return pages
 
-    async def paginate_chat_embed(self, response_text):
-        """Given a response text make embed pages and return a list of the pages."""
-
-        response_text = [
-            response_text[i : i + 3500] for i in range(0, len(response_text), 7000)
-        ]
-        pages = []
-        first = False
-        # Send each chunk as a message
-        for count, chunk in enumerate(response_text, start=1):
-            if not first:
-                page = discord.Embed(
-                    title=f"{count}",
-                    description=chunk,
-                )
-                first = True
-            else:
-                page = discord.Embed(
-                    title=f"{count}",
-                    description=chunk,
-                )
-            pages.append(page)
-
-        return pages
-
     @discord.Cog.listener()
     async def on_message(self, message):
         # Check if the message is from a bot.
@@ -314,6 +309,10 @@ class SearchService(discord.Cog, name="SearchService"):
 
         # Check if the message is from a guild.
         if not message.guild:
+            return
+
+        # System message
+        if message.type != discord.MessageType.default:
             return
 
         if message.content.strip().startswith("~"):
@@ -364,6 +363,9 @@ class SearchService(discord.Cog, name="SearchService"):
             used_tools = []
             try:
                 # Start listening to STDOUT before this call. We wanna track all the output for this specific call below
+                self.usage_service.update_usage_memory(
+                    message.guild.name, "internet_chat_message", 1
+                )
                 response, stdout_output = await capture_stdout(
                     self.bot.loop.run_in_executor, None, agent.run, prompt
                 )
@@ -388,17 +390,18 @@ class SearchService(discord.Cog, name="SearchService"):
                 await message.reply(
                     embed=EmbedStatics.get_internet_chat_failure_embed(response)
                 )
-                self.thread_awaiting_responses.remove(message.channel.id)
+                safe_remove_list(self.thread_awaiting_responses, message.channel.id)
                 return
 
             if len(response) > 2000:
-                embed_pages = await self.paginate_chat_embed(response)
-                paginator = pages.Paginator(
-                    pages=embed_pages,
-                    timeout=None,
-                    author_check=False,
-                )
-                await paginator.respond(message)
+                embed_pages = EmbedStatics.paginate_chat_embed(response)
+
+                for x, page in enumerate(embed_pages):
+                    if x == 0:
+                        previous_message = await message.reply(embed=page)
+                    else:
+                        previous_message = previous_message.reply(embed=page)
+
             else:
                 response = response.replace("\\n", "\n")
                 # Build a response embed
@@ -413,28 +416,33 @@ class SearchService(discord.Cog, name="SearchService"):
                     )
                 await message.reply(embed=response_embed)
 
-            self.thread_awaiting_responses.remove(message.channel.id)
+            safe_remove_list(self.thread_awaiting_responses, message.channel.id)
 
     async def search_chat_command(
-        self, ctx: discord.ApplicationContext, search_scope=2, use_gpt4: bool = False
+        self,
+        ctx: discord.ApplicationContext,
+        model,
+        search_scope=2,
+        temperature=0,
+        top_p=1,
     ):
+        await ctx.defer()
         embed_title = f"{ctx.user.name}'s internet-connected conversation with GPT"
         message_embed = discord.Embed(
             title=embed_title,
-            description=f"The agent will visit and browse **{search_scope}** link(s) every time it needs to access the internet.\nCrawling is enabled, send the bot a link for it to access it!\nModel: {'gpt-3.5-turbo' if not use_gpt4 else 'GPT-4'}\n\nType `end` to stop the conversation",
+            description=f"The agent will visit and browse **{search_scope}** link(s) every time it needs to access the internet.\nCrawling is enabled, send the bot a link for it to access it!\nModel: {model}\n\nType `end` to stop the conversation",
             color=0xBA6093,
         )
-        message_embed.set_thumbnail(url="https://i.imgur.com/lt5AYJ9.png")
+        message_embed.set_thumbnail(url="https://i.imgur.com/sioynYZ.png")
         message_embed.set_footer(
-            text="Internet Chat", icon_url="https://i.imgur.com/lt5AYJ9.png"
+            text="Internet Chat", icon_url="https://i.imgur.com/sioynYZ.png"
         )
         message_thread = await ctx.send(embed=message_embed)
         thread = await message_thread.create_thread(
             name=ctx.user.name + "'s internet-connected conversation with GPT",
             auto_archive_duration=60,
         )
-        await ctx.respond("Conversation started.")
-        print("The search scope is " + str(search_scope) + ".")
+        await safe_ctx_respond(ctx=ctx, content="Conversation started.")
 
         # Make a new agent for this user to chat.
         search = GoogleSearchAPIWrapper(
@@ -455,7 +463,7 @@ class SearchService(discord.Cog, name="SearchService"):
             Tool(
                 name="Web-Crawling-Tool",
                 func=requests.get,
-                description=f"Useful for when the user provides you with a website link, use this tool to crawl the website and retrieve information from it. The input to this tool is a comma separated list of three values, the first value is the link to crawl for, and the second value is the value of use_gpt4, which is {use_gpt4}, and the third value is the original question that the user asked. For example, an input could be 'https://google.com', False, 'What is this webpage?'. This tool should only be used if a direct link is provided and not in conjunction with other tools.",
+                description=f"Useful for when the user provides you with a website link, use this tool to crawl the website and retrieve information from it. The input to this tool is a comma separated list of three values, the first value is the link to crawl for, and the second value is {model} and is the GPT model used, and the third value is the original question that the user asked. For example, an input could be 'https://google.com', gpt-4-32k, 'What is this webpage?'. This tool should only be used if a direct link is provided and not in conjunction with other tools. The link should always start with http or https.",
             ),
         ]
 
@@ -474,28 +482,38 @@ class SearchService(discord.Cog, name="SearchService"):
             traceback.print_exc()
             print("Wolfram tool not added to internet-connected conversation agent.")
 
-        memory = ConversationBufferMemory(
-            memory_key="chat_history", return_messages=True
+        llm = ChatOpenAI(
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            openai_api_key=OPENAI_API_KEY,
         )
 
-        if use_gpt4:
-            llm = ChatOpenAI(
-                model="gpt-4", temperature=0, openai_api_key=OPENAI_API_KEY
-            )
-        else:
-            llm = ChatOpenAI(
-                model="gpt-3.5-turbo", temperature=0, openai_api_key=OPENAI_API_KEY
-            )
+        max_token_limit = 29000 if "gpt-4" in model else 7500
+
+        memory = ConversationSummaryBufferMemory(
+            memory_key="memory",
+            return_messages=True,
+            llm=llm,
+            max_token_limit=100000 if "preview" in model else max_token_limit,
+        )
+
+        agent_kwargs = {
+            "extra_prompt_messages": [MessagesPlaceholder(variable_name="memory")],
+            "system_message": SystemMessage(
+                content="You are a superpowered version of GPT-4 that is able to access the internet. You can use google search to browse the web, you can crawl the web to see the content of specific websites, and in some cases you can also use Wolfram Alpha to perform mathematical operations. Use all of these tools to your advantage. You can use tools multiple times, for example if asked a complex question, search multiple times for different pieces of info until you achieve your goal."
+            ),
+        }
 
         agent_chain = initialize_agent(
-            tools,
-            llm,
-            agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
+            tools=tools,
+            llm=llm,
+            agent=AgentType.OPENAI_FUNCTIONS,
             verbose=True,
+            agent_kwargs=agent_kwargs,
             memory=memory,
-            max_execution_time=120,
-            max_iterations=4,
-            early_stopping_method="generate",
+            handle_parsing_errors="Check your output and make sure it conforms!",
+            max_iterations=5,
         )
 
         self.chat_agents[thread.id] = agent_chain
@@ -508,7 +526,7 @@ class SearchService(discord.Cog, name="SearchService"):
         nodes,
         deep,
         response_mode,
-        model="gpt-3.5-turbo",
+        model,
         multistep=False,
         redo=None,
         from_followup=None,
@@ -732,4 +750,5 @@ class FollowupModal(discord.ui.Modal):
             from_followup=FollowupData(message_link, self.children[0].value),
             response_mode=self.search_cog.redo_users[self.ctx.user.id].response_mode,
             followup_user=interaction.user,
+            model="gpt-4-32k",
         )

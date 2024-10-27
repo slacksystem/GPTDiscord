@@ -25,6 +25,10 @@ class ImageService:
         vary=None,
         draw_from_optimizer=None,
         custom_api_key=None,
+        dalle_3=False,
+        quality=None,
+        image_size=None,
+        style=None,
     ):
         """service function that takes input and returns an image generation
 
@@ -43,12 +47,22 @@ class ImageService:
         from_context = isinstance(ctx, discord.ApplicationContext)
 
         try:
-            file, image_urls = await image_service_cog.model.send_image_request(
-                ctx,
-                prompt,
-                vary=vary if not draw_from_optimizer else None,
-                custom_api_key=custom_api_key,
-            )
+            if not dalle_3:
+                file, image_urls = await image_service_cog.model.send_image_request_old(
+                    ctx,
+                    prompt,
+                    vary=vary if not draw_from_optimizer else None,
+                    custom_api_key=custom_api_key,
+                )
+            else:
+                file, image_urls = await image_service_cog.model.send_image_request(
+                    ctx,
+                    prompt,
+                    quality,
+                    image_size,
+                    style,
+                    custom_api_key=custom_api_key,
+                )
 
         # Error catching for API errors
         except aiohttp.ClientResponseError as e:
@@ -72,11 +86,15 @@ class ImageService:
 
         # Start building an embed to send to the user with the results of the image generation
         embed = discord.Embed(
-            title="Image Generation Results"
-            if not vary
-            else "Image Generation Results (Varying)"
-            if not draw_from_optimizer
-            else "Image Generation Results (Drawing from Optimizer)",
+            title=(
+                "Image Generation Results"
+                if not vary
+                else (
+                    "Image Generation Results (Varying)"
+                    if not draw_from_optimizer
+                    else "Image Generation Results (Drawing from Optimizer)"
+                )
+            ),
             description=f"{prompt}",
             color=0xC730C7,
         )
@@ -104,6 +122,7 @@ class ImageService:
                     image_service_cog.converser_cog,
                     result_message,
                     custom_api_key=custom_api_key,
+                    dalle_3=dalle_3,
                 )
             )
 
@@ -123,6 +142,10 @@ class ImageService:
                 response=result_message,
                 instruction=None,
                 paginator=None,
+                dalle_3=dalle_3,
+                quality=quality,
+                image_size=image_size,
+                style=style,
             )
 
         else:
@@ -139,6 +162,7 @@ class ImageService:
                         image_service_cog.converser_cog,
                         message,
                         custom_api_key=custom_api_key,
+                        dalle_3=dalle_3,
                     )
                 )
             else:  # Varying case
@@ -205,6 +229,7 @@ class SaveView(discord.ui.View):
         no_retry=False,
         only_save=None,
         custom_api_key=None,
+        dalle_3=False,
     ):
         super().__init__(
             timeout=3600 if not only_save else None
@@ -216,6 +241,7 @@ class SaveView(discord.ui.View):
         self.converser_cog = converser_cog
         self.message = message
         self.custom_api_key = custom_api_key
+        self.dalle_3 = dalle_3
         for x in range(1, len(image_urls) + 1):
             self.add_item(SaveButton(x, image_urls[x - 1]))
         if not only_save:
@@ -227,16 +253,17 @@ class SaveView(discord.ui.View):
                         custom_api_key=self.custom_api_key,
                     )
                 )
-            for x in range(1, len(image_urls) + 1):
-                self.add_item(
-                    VaryButton(
-                        x,
-                        image_urls[x - 1],
-                        self.cog,
-                        converser_cog=self.converser_cog,
-                        custom_api_key=self.custom_api_key,
+            if not self.dalle_3:
+                for x in range(1, len(image_urls) + 1):
+                    self.add_item(
+                        VaryButton(
+                            x,
+                            image_urls[x - 1],
+                            self.cog,
+                            converser_cog=self.converser_cog,
+                            custom_api_key=self.custom_api_key,
+                        )
                     )
-                )
 
     # On the timeout event, override it and we want to clear the items.
     async def on_timeout(self):
@@ -256,7 +283,10 @@ class SaveView(discord.ui.View):
         )
 
         # Set the view of the message to the new view
-        await self.ctx.edit(view=new_view)
+        try:
+            await self.ctx.edit(view=new_view)
+        except:
+            pass
 
 
 class VaryButton(discord.ui.Button):
@@ -371,7 +401,7 @@ class RedoButton(discord.ui.Button["SaveView"]):
 
         if interaction_id not in self.converser_cog.users_to_interactions[user_id]:
             await interaction.response.send_message(
-                content="You can only retry for prompts that you generated yourself!",
+                content="You can only retry for the last prompt that you generated yourself!",
                 ephemeral=True,
             )
             return
@@ -382,6 +412,10 @@ class RedoButton(discord.ui.Button["SaveView"]):
             ctx = self.cog.redo_users[user_id].ctx
             prompt = self.cog.redo_users[user_id].prompt
             response_message = self.cog.redo_users[user_id].response
+            dalle_3 = self.cog.redo_users[user_id].dalle_3
+            quality = self.cog.redo_users[user_id].quality
+            image_size = self.cog.redo_users[user_id].image_size
+            style = self.cog.redo_users[user_id].style
             message = await interaction.response.send_message(
                 "Regenerating the image for your original prompt, check the original message.",
                 ephemeral=True,
@@ -396,5 +430,9 @@ class RedoButton(discord.ui.Button["SaveView"]):
                     ctx,
                     response_message,
                     custom_api_key=self.custom_api_key,
+                    dalle_3=dalle_3,
+                    quality=quality,
+                    image_size=image_size,
+                    style=style,
                 )
             )

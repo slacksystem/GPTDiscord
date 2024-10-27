@@ -87,6 +87,20 @@ class Settings_autocompleter:
         await ctx.interaction.response.defer()  # defer so the autocomplete in int values doesn't error but rather just says not found
         return []
 
+    async def get_function_calling_models(ctx: discord.AutocompleteContext):
+        return [
+            "gpt-4",
+            "gpt-4-32k",
+            "gpt-4-1106-preview",
+            "gpt-4-0613",
+            "gpt-3.5-turbo",
+            "gpt-3.5-turbo-1106",
+            "gpt-3.5-turbo-0613",
+            "gpt-4-turbo-preview",
+            "gpt-4-turbo",
+            "gpt-4o",
+        ]
+
     async def get_models(
         ctx: discord.AutocompleteContext,
     ):
@@ -99,7 +113,8 @@ class Settings_autocompleter:
     async def get_index_and_search_models(
         ctx: discord.AutocompleteContext,
     ):
-        return ["gpt-3.5-turbo", "gpt-4"]
+        models = Models.CHATGPT_MODELS + Models.GPT4_MODELS
+        return [value for value in models if value.startswith(ctx.value.lower())]
 
     async def get_converse_models(
         ctx: discord.AutocompleteContext,
@@ -109,6 +124,15 @@ class Settings_autocompleter:
             value for value in Models.TEXT_MODELS if value.startswith(ctx.value.lower())
         ]
         return models
+
+    async def get_dalle3_image_qualities(ctx: discord.AutocompleteContext):
+        return ["hd", "standard"]
+
+    async def get_dalle3_image_sizes(ctx: discord.AutocompleteContext):
+        return ["1024x1024", "1792x1024", "1024x1792"]
+
+    async def get_dalle3_image_styles(ctx: discord.AutocompleteContext):
+        return ["natural", "vivid"]
 
     async def get_value_moderations(
         ctx: discord.AutocompleteContext,

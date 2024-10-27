@@ -1,7 +1,9 @@
+from collections import defaultdict
 from pathlib import Path
 
 import aiofiles
-from transformers import GPT2TokenizerFast
+from typing import Literal
+import tiktoken
 
 
 class UsageService:
@@ -12,55 +14,71 @@ class UsageService:
             with self.usage_file_path.open("w") as f:
                 f.write("0.00")
                 f.close()
-        self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.usage = defaultdict()
 
-    async def get_price(
-        self,
-        tokens_used,
-        prompt_tokens=None,
-        completion_tokens=None,
-        embeddings=False,
-        chatgpt=False,
-        gpt4=False,
-    ):
-        tokens_used = int(tokens_used)
-        if gpt4:
-            price = (tokens_used / 1000) * 0.05  # This is a very rough estimate
-            return price
-        elif chatgpt:
-            price = (tokens_used / 1000) * 0.002
-            return price
-        elif not embeddings:
-            price = (tokens_used / 1000) * 0.02
+    COST_MAPPING = {
+        "gpt4": 0.06,
+        "gpt4-32": 0.12,
+        "turbo": 0.002,
+        "turbo-16": 0.002,
+        "davinci": 0.02,
+        "curie": 0.002,
+        "embedding": 0.0001,
+        "gpt-turbo": 0.03,
+    }
+
+    MODEL_COST_MAP = {
+        "gpt-4": "gpt4",
+        "gpt-4-32k": "gpt4-32",
+        "gpt-4-0613": "gpt4",
+        "gpt-4-32k-0613": "gpt4-32",
+        "gpt-3.5-turbo": "turbo",
+        "gpt-3.5-turbo-16k": "turbo-16",
+        "gpt-3.5-turbo-0613": "turbo",
+        "gpt-3.5-turbo-16k-0613": "turbo",
+        "text-davinci-003": "davinci",
+        "text-curie-001": "curie",
+        "gpt-4-1106-preview": "gpt-turbo",
+        "gpt-4-1106-vision-preview": "gpt-turbo",
+    }
+
+    ModeType = Literal["gpt4", "gpt4-32k", "turbo", "turbo-16k", "davinci", "embedding"]
+
+    @staticmethod
+    async def get_model_cost(mode: ModeType) -> float:
+        return UsageService.COST_MAPPING.get(mode, 0)
+
+    @staticmethod
+    async def get_cost_name(model) -> str:
+        return UsageService.MODEL_COST_MAP.get(model, "davinci")
+
+    async def get_price(self, tokens_used, mode: ModeType = None):
+        if isinstance(tokens_used, str) or isinstance(tokens_used, int):
+            tokens_used = int(tokens_used)
         else:
-            price = (tokens_used / 1000) * 0.0004
+            tokens_used = int(len(tokens_used))
+        price = (tokens_used / 1000) * await self.get_model_cost(
+            mode
+        )  # This is a very rough estimate
+        price = round(price, 6)
         return price
 
     async def update_usage(
         self,
         tokens_used,
-        prompt_tokens=None,
-        completion_tokens=None,
-        embeddings=False,
-        chatgpt=False,
-        gpt4=False,
+        mode: ModeType = None,
     ):
         tokens_used = int(tokens_used)
-        if gpt4:
-            price = (tokens_used / 1000) * 0.05  # This is a very rough estimate..
-        elif chatgpt:
-            price = (tokens_used / 1000) * 0.002
-        elif not embeddings:
-            price = (tokens_used / 1000) * 0.02
-        else:
-            price = (tokens_used / 1000) * 0.0004
-        usage = await self.get_usage()
+        price = (tokens_used / 1000) * await self.get_model_cost(mode)
+        price = round(price, 6)
+        usage = round(await self.get_usage(), 6)
+        new_total = round(usage + price, 6)
         print(
-            f"Cost -> Old: {str(usage)} | New: {str(usage + float(price))}, used {str(float(price))} credits"
+            f"{'Completion' if mode != 'embedding' else 'Embed'} cost -> Old: {str(usage)} | New: {str(new_total)}, used {str(price)} credits"
         )
-        # Do the same as above but with aiofiles
         async with aiofiles.open(self.usage_file_path, "w") as f:
-            await f.write(str(usage + float(price)))
+            await f.write(str(new_total))
             await f.close()
 
     async def set_usage(self, usage):
@@ -75,20 +93,21 @@ class UsageService:
         return usage
 
     def count_tokens(self, text):
-        res = self.tokenizer(text)["input_ids"]
+        res = self.tokenizer.encode(text)
         return len(res)
 
     async def update_usage_image(self, image_size):
-        # 1024×1024    $0.020 / image
-        # 512×512    $0.018 / image
-        # 256×256    $0.016 / image
-
+        image_size = image_size.split(" ")[0]
         if image_size == "1024x1024":
-            price = 0.02
+            price = 0.04
         elif image_size == "512x512":
             price = 0.018
         elif image_size == "256x256":
             price = 0.016
+        elif image_size == "1792x1024":
+            price = 0.08
+        elif image_size == "1024x1792":
+            price = 0.08
         else:
             raise ValueError("Invalid image size")
 
@@ -98,8 +117,23 @@ class UsageService:
             await f.write(str(usage + float(price)))
             await f.close()
 
+    def update_usage_memory(self, guild_name, functionality, usage):
+        if guild_name in self.usage:
+            if functionality in self.usage[guild_name]:
+                self.usage[guild_name][functionality] += usage
+            else:
+                self.usage[guild_name][functionality] = usage
+        else:
+            self.usage[guild_name] = {functionality: usage}
+
+    def get_usage_memory(self, guild_name):
+        return self.usage[guild_name] if guild_name in self.usage else {}
+
+    def get_usage_memory_all(self):
+        return self.usage
+
     @staticmethod
     def count_tokens_static(text):
-        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-        res = tokenizer(text)["input_ids"]
+        tokenizer = tiktoken.get_encoding("cl100k_base")
+        res = tokenizer.encode(text)
         return len(res)

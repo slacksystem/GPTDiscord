@@ -11,6 +11,7 @@ from services.environment_service import EnvService
 from services.image_service import ImageService
 from services.moderations_service import Moderation
 from services.text_service import TextService
+from utils.safe_ctx_respond import safe_ctx_respond
 
 users_to_interactions = {}
 ALLOWED_GUILDS = EnvService.get_allowed_guilds()
@@ -37,6 +38,62 @@ class DrawDallEService(discord.Cog, name="DrawDallEService"):
         self.redo_users = {}
 
     async def draw_command(
+        self,
+        ctx: discord.ApplicationContext,
+        prompt: str,
+        quality: str,
+        image_size: str,
+        style: str,
+        from_action=False,
+    ):
+        """With an ApplicationContext and prompt, send a dalle image to the invoked channel. Ephemeral if from an action"""
+        user_api_key = None
+        if USER_INPUT_API_KEYS:
+            user_api_key = await TextService.get_user_api_key(
+                ctx.user.id, ctx, USER_KEY_DB
+            )
+            if not user_api_key:
+                return
+
+        await ctx.defer()
+
+        # Check the opener for bad content.
+        if PRE_MODERATE:
+            if await Moderation.simple_moderate_and_respond(prompt, ctx):
+                return
+
+        user = ctx.user
+
+        if user == self.bot.user:
+            return
+
+        try:
+            asyncio.ensure_future(
+                ImageService.encapsulated_send(
+                    self,
+                    user.id,
+                    prompt,
+                    ctx,
+                    custom_api_key=user_api_key,
+                    dalle_3=True,
+                    quality=quality,
+                    image_size=image_size,
+                    style=style,
+                )
+            )
+            self.usage_service.update_usage_memory(ctx.guild.name, "image_drawn", 1)
+
+        except Exception as e:
+            print(e)
+            traceback.print_exc()
+            await safe_ctx_respond(
+                ctx=ctx,
+                content="Something went wrong. Please try again later.",
+                ephemeral=from_action,
+            )
+            await ctx.send_followup(e, ephemeral=from_action)
+
+    async def draw_old_command(
         self, ctx: discord.ApplicationContext, prompt: str, from_action=False
     ):
         """With an ApplicationContext and prompt, send a dalle image to the invoked channel. Ephemeral if from an action"""
@@ -70,14 +127,24 @@ class DrawDallEService(discord.Cog, name="DrawDallEService"):
         except Exception as e:
             print(e)
             traceback.print_exc()
-            await ctx.respond(
-                "Something went wrong. Please try again later.", ephemeral=from_action
+            await safe_ctx_respond(
+                ctx=ctx,
+                content="Something went wrong. Please try again later.",
+                ephemeral=from_action,
             )
+
             await ctx.send_followup(e, ephemeral=from_action)
 
     async def draw_action(self, ctx, message):
         """decoupler to handle context actions for the draw command"""
-        await self.draw_command(ctx, message.content, from_action=True)
+        await self.draw_command(
+            ctx,
+            message.content,
+            quality="hd",
+            image_size="1024x1024",
+            style="vivid",
+            from_action=True,
+        )
 
     async def local_size_command(self, ctx: discord.ApplicationContext):
         """Get the folder size of the image folder"""
@@ -92,7 +159,9 @@ class DrawDallEService(discord.Cog, name="DrawDallEService"):
 
         # Format the size to be in MB and send.
         total_size = total_size / 1000000
-        await ctx.respond(f"The size of the local images folder is {total_size} MB.")
+        await safe_ctx_respond(
+            ctx=ctx, content=f"The size of the local images folder is {total_size} MB."
+        )
 
     async def clear_local_command(self, ctx):
         """Delete all local images"""
